@@ -5,6 +5,7 @@
 *.class
 
 # Log files
+logs/
 *.log
 
 # Package files
