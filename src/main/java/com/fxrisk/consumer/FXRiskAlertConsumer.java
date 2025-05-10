@@ -1,220 +1,315 @@
 package com.fxrisk.consumer;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fxrisk.config.KafkaConfig;
 import com.fxrisk.model.FXTrade;
-import com.fxrisk.util.JsonSerializer;
-import org.apache.kafka.clients.consumer.*;
+import com.fxrisk.model.RiskLevel;
+import com.fxrisk.serialization.JsonSerializer;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.errors.WakeupException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
-import java.util.*;
+import java.util.Collections;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class FXRiskAlertConsumer implements Runnable, AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(FXRiskAlertConsumer.class);
-    private static final String DLQ_TOPIC = "fx-trades-dlq"; // Dead Letter Queue for failed messages
-    private static final int MAX_RETRIES = 3;
+    private static final String DLQ_TOPIC = "fx-trades-dlq";
+    private static final Duration POLL_TIMEOUT = Duration.ofMillis(100);
+    private static final Duration ERROR_RETRY_DELAY = Duration.ofSeconds(1);
     
-    private final Consumer<String, String> consumer;
-    private final Producer<String, String> alertProducer;
-    private final Producer<String, String> dlqProducer; // Producer for Dead Letter Queue
-    private final AtomicBoolean running = new AtomicBoolean(true);
-    private final String consumerGroupId;
-    private final Map<String, Integer> retryCount = new HashMap<>();
-
-    public FXRiskAlertConsumer(String consumerGroupId) {
-        this.consumerGroupId = consumerGroupId;
-        this.consumer = new KafkaConsumer<>(KafkaConfig.getConsumerProperties(consumerGroupId));
-        this.alertProducer = new KafkaProducer<>(KafkaConfig.getProducerProperties());
-        this.dlqProducer = new KafkaProducer<>(KafkaConfig.getProducerProperties());
+    protected final Consumer<String, String> consumer;
+    protected final Producer<String, String> alertProducer;
+    protected final Producer<String, String> dlqProducer;
+    private final JsonSerializer<FXTrade> serializer;
+    private final AtomicBoolean running;
+    
+    // Performance monitoring metrics
+    private final AtomicLong processedTradeCount = new AtomicLong(0);
+    private final AtomicLong highRiskTradeCount = new AtomicLong(0);
+    private final AtomicLong failedTradeCount = new AtomicLong(0);
+    
+    public FXRiskAlertConsumer() {
+        this(
+            new KafkaConsumer<>(KafkaConfig.getConsumerProperties("fx-risk-monitor")),
+            new KafkaProducer<>(KafkaConfig.getProducerProperties()),
+            new KafkaProducer<>(KafkaConfig.getProducerProperties())
+        );
     }
-
+    
+    /**
+     * Constructor that accepts a consumer group ID and alert topic
+     * 
+     * @param consumerGroupId The consumer group ID to use
+     * @param alertTopic The topic to publish alerts to (usually KafkaConfig.FX_RISK_ALERTS_TOPIC)
+     */
+    public FXRiskAlertConsumer(String consumerGroupId, String alertTopic) {
+        this(
+            new KafkaConsumer<>(KafkaConfig.getConsumerProperties(consumerGroupId)),
+            new KafkaProducer<>(KafkaConfig.getProducerProperties()),
+            new KafkaProducer<>(KafkaConfig.getProducerProperties())
+        );
+    }
+    
+    /**
+     * Constructor with a single String parameter for consumer group ID
+     * 
+     * @param consumerGroupId The consumer group ID to use
+     */
+    public FXRiskAlertConsumer(String consumerGroupId) {
+        this(
+            new KafkaConsumer<>(KafkaConfig.getConsumerProperties(consumerGroupId)),
+            new KafkaProducer<>(KafkaConfig.getProducerProperties()),
+            new KafkaProducer<>(KafkaConfig.getProducerProperties())
+        );
+    }
+    
+    public FXRiskAlertConsumer(
+            Consumer<String, String> consumer,
+            Producer<String, String> alertProducer,
+            Producer<String, String> dlqProducer
+    ) {
+        this.consumer = consumer;
+        this.alertProducer = alertProducer;
+        this.dlqProducer = dlqProducer;
+        this.serializer = new JsonSerializer<>();
+        this.running = new AtomicBoolean(true);
+    }
+    
     @Override
     public void run() {
         try {
-            consumer.subscribe(Collections.singletonList(KafkaConfig.FX_TRADES_TOPIC), new ConsumerRebalanceListener() {
-                @Override
-                public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
-                    // This is called before a rebalance starts and after the consumer stops fetching data
-                    logger.info("Partitions revoked: {}", partitions);
-                    // Commit offsets for the partitions we're about to lose
-                    consumer.commitSync(); 
-                }
-
-                @Override
-                public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
-                    // This is called after partitions have been reassigned to the consumer
-                    logger.info("Partitions assigned: {}", partitions);
-                }
-            });
+            consumer.subscribe(Collections.singletonList(KafkaConfig.FX_TRADES_TOPIC));
+            logger.info("FX Risk Alert Consumer started, subscribed to: {}", KafkaConfig.FX_TRADES_TOPIC);
             
-            logger.info("FX risk alert consumer started with group: {}", consumerGroupId);
-
             while (running.get()) {
                 try {
-                    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
-                    Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = new HashMap<>();
+                    ConsumerRecords<String, String> records = consumer.poll(POLL_TIMEOUT);
                     
-                    for (ConsumerRecord<String, String> record : records) {
-                        boolean processed = processFXTradeRecord(record);
-                        
-                        // If processed successfully, track the offset
-                        if (processed) {
-                            TopicPartition partition = new TopicPartition(record.topic(), record.partition());
-                            offsetsToCommit.put(partition, new OffsetAndMetadata(record.offset() + 1));
-                        }
-                    }
-                    
-                    // Commit offsets for successfully processed records
-                    if (!offsetsToCommit.isEmpty()) {
-                        consumer.commitSync(offsetsToCommit);
+                    if (!records.isEmpty()) {
+                        processTradeRecords(records);
+                        commitOffsets();
                     }
                 } catch (WakeupException e) {
                     // Ignore exception if closing
-                    if (running.get()) {
-                        throw e;
+                    if (!running.get()) {
+                        break;
                     }
+                    throw e;
+                } catch (KafkaException ke) {
+                    logger.error("Kafka error while processing records", ke);
+                    sleepOnError();
                 } catch (Exception e) {
-                    logger.error("Error in FX risk alert consumer polling loop", e);
-                    // Short pause before retrying on unexpected errors
-                    Thread.sleep(1000);
+                    logger.error("Unexpected error processing records", e);
+                    sleepOnError();
                 }
             }
-        } catch (Exception e) {
-            logger.error("Fatal error in FX risk alert consumer", e);
         } finally {
-            try {
-                consumer.close();
-                logger.info("Consumer closed");
-            } catch (Exception e) {
-                logger.error("Error closing consumer", e);
-            }
+            closeResources();
         }
     }
-
-    private boolean processFXTradeRecord(ConsumerRecord<String, String> record) {
-        String key = record.key();
-        String value = record.value();
+    
+    private void processTradeRecords(ConsumerRecords<String, String> records) {
+        for (ConsumerRecord<String, String> record : records) {
+            processTradeRecord(record);
+        }
+    }
+    
+    private void commitOffsets() {
+        try {
+            consumer.commitSync();
+        } catch (Exception e) {
+            logger.error("Failed to commit offsets", e);
+        }
+    }
+    
+    private void sleepOnError() {
+        try {
+            Thread.sleep(ERROR_RETRY_DELAY.toMillis());
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+    }
+    
+    protected void processTradeRecord(ConsumerRecord<String, String> record) {
+        String tradeId = record.key();
+        String tradeJson = record.value();
         
-        logger.debug("Processing FX trade record - Key: {}, Partition: {}, Offset: {}",
-                key, record.partition(), record.offset());
+        if (tradeId == null || tradeId.isEmpty()) {
+            logger.warn("Received trade record with null or empty key, using offset as ID");
+            tradeId = "unknown-" + record.partition() + "-" + record.offset();
+        }
+        
+        logger.info("Processing trade record: {}", tradeId);
         
         try {
-            FXTrade trade = JsonSerializer.deserialize(value, FXTrade.class);
+            FXTrade trade = deserializeTradeRecord(tradeJson);
+            RiskLevel riskLevel = trade.calculateRiskScore();
             
-            // Check if trade is high risk based on risk score and threshold
-            if (isHighRisk(trade)) {
-                publishRiskAlert(trade);
+            processedTradeCount.incrementAndGet();
+            
+            if (riskLevel == RiskLevel.HIGH) {
+                highRiskTradeCount.incrementAndGet();
+                sendRiskAlert(tradeId, trade, riskLevel);
             } else {
-                logger.debug("Normal risk level for trade: {}", key);
+                logger.info("Trade {} has {} risk level. No alert needed.", tradeId, riskLevel);
             }
-            
-            // Reset retry count on success
-            retryCount.remove(key);
-            return true;
-            
-        } catch (RuntimeException e) {
-            if (e.getCause() instanceof JsonProcessingException) {
-                // Handle deserialization errors
-                logger.error("Failed to deserialize trade data: {}", value, e);
-                sendToDeadLetterQueue(key, value, "Deserialization error: " + e.getMessage());
-                return true; // Consider it "processed" even though it failed (we're sending to DLQ)
-            } else {
-                // For other runtime errors, retry logic
-                int attempts = retryCount.getOrDefault(key, 0) + 1;
-                retryCount.put(key, attempts);
-                
-                if (attempts >= MAX_RETRIES) {
-                    logger.error("Max retries reached for trade: {}. Sending to DLQ.", key);
-                    sendToDeadLetterQueue(key, value, "Processing error after " + attempts + " retries: " + e.getMessage());
-                    return true; // Mark as processed after sending to DLQ
-                } else {
-                    logger.warn("Processing error for trade: {}. Retry attempt {}/{}",
-                            key, attempts, MAX_RETRIES, e);
-                    return false; // Don't commit offset, will retry
-                }
-            }
+        } catch (Exception e) {
+            logger.error("Failed to process trade record: {}", tradeId, e);
+            failedTradeCount.incrementAndGet();
+            sendToDlq(tradeId, tradeJson);
         }
     }
     
-    private boolean isHighRisk(FXTrade trade) {
-        return trade.getRiskScore().compareTo(trade.getRiskThreshold()) > 0;
+    protected FXTrade deserializeTradeRecord(String tradeJson) {
+        if (tradeJson == null || tradeJson.isEmpty()) {
+            throw new IllegalArgumentException("Trade JSON data is null or empty");
+        }
+        
+        try {
+            return serializer.deserialize(tradeJson, FXTrade.class);
+        } catch (Exception e) {
+            logger.error("Failed to deserialize trade record: {}", e.getMessage());
+            throw e;
+        }
     }
     
-    private void publishRiskAlert(FXTrade trade) {
+    protected CompletableFuture<Void> sendRiskAlert(String tradeId, FXTrade trade, RiskLevel riskLevel) {
         String alertMessage = String.format(
-                "HIGH RISK ALERT: %s %s trade for %s %s with risk score %s (threshold: %s)",
-                trade.getCurrencyPair(), 
-                trade.getDirection(),
-                trade.getAmount(),
-                trade.getCurrencyPair(),
-                trade.getRiskScore(), 
-                trade.getRiskThreshold()
+            "HIGH RISK ALERT: Trade %s, %s %s %s with %s has high risk score",
+            tradeId,
+            trade.getDirection(),
+            trade.getAmount(),
+            trade.getCurrencyPair(),
+            trade.getCounterparty()
         );
         
-        logger.info(alertMessage);
+        logger.info("Sending risk alert: {}", alertMessage);
         
-        // Publish to alerts topic
-        try {
-            alertProducer.send(
-                new ProducerRecord<>(
-                    KafkaConfig.FX_RISK_ALERTS_TOPIC,
-                    trade.getTradeId(),
-                    alertMessage
-                )
-            ).get(); // Wait for confirmation of delivery
-            
-            logger.debug("Alert published successfully for trade: {}", trade.getTradeId());
-        } catch (Exception e) {
-            logger.error("Failed to publish alert for trade: {}", trade.getTradeId(), e);
-            // We don't retry here since this is an alert publishing failure,
-            // but in a production system you might want different error handling
-        }
+        ProducerRecord<String, String> alertRecord = new ProducerRecord<>(
+            KafkaConfig.FX_RISK_ALERTS_TOPIC,
+            tradeId,
+            alertMessage
+        );
+        
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        
+        alertProducer.send(alertRecord, (metadata, exception) -> {
+            if (exception != null) {
+                logger.error("Failed to send risk alert for trade {}", tradeId, exception);
+                future.completeExceptionally(exception);
+            } else {
+                logger.info("Risk alert sent for trade {}", tradeId);
+                future.complete(null);
+            }
+        });
+        
+        return future;
     }
     
-    private void sendToDeadLetterQueue(String key, String value, String errorMessage) {
+    protected void sendToDlq(String tradeId, String originalMessage) {
+        logger.info("Sending message to DLQ: {}", tradeId);
+        
+        // Add error context to the message
+        String dlqMessage = String.format(
+            "{\"original_message\":%s,\"error_context\":{\"timestamp\":\"%s\",\"reason\":\"Processing failure\"}}",
+            originalMessage,
+            java.time.Instant.now()
+        );
+        
+        ProducerRecord<String, String> dlqRecord = new ProducerRecord<>(
+            DLQ_TOPIC,
+            tradeId,
+            dlqMessage
+        );
+        
+        dlqProducer.send(dlqRecord, (metadata, exception) -> {
+            if (exception != null) {
+                logger.error("Failed to send message to DLQ for trade {}", tradeId, exception);
+            } else {
+                logger.info("Message sent to DLQ for trade {}", tradeId);
+            }
+        });
+    }
+    
+    private void closeResources() {
+        logger.info("Closing FX Risk Alert Consumer - processed: {}, high risk: {}, failed: {}", 
+            processedTradeCount.get(), highRiskTradeCount.get(), failedTradeCount.get());
+            
         try {
-            // Create a DLQ message with the original message and error details
-            Map<String, Object> dlqMessage = new HashMap<>();
-            dlqMessage.put("original_key", key);
-            dlqMessage.put("original_value", value);
-            dlqMessage.put("error", errorMessage);
-            dlqMessage.put("timestamp", System.currentTimeMillis());
-            dlqMessage.put("topic", KafkaConfig.FX_TRADES_TOPIC);
-            
-            String dlqValue = JsonSerializer.serialize(dlqMessage);
-            
-            // Send to DLQ topic
-            dlqProducer.send(new ProducerRecord<>(DLQ_TOPIC, key, dlqValue)).get();
-            logger.info("Message sent to DLQ: {}", key);
-            
+            consumer.close();
+            logger.info("Consumer closed");
         } catch (Exception e) {
-            logger.error("Failed to send message to DLQ: {}", key, e);
+            logger.error("Error closing consumer", e);
         }
-    }
-
-    public void shutdown() {
-        logger.info("Shutting down FX risk alert consumer...");
-        running.set(false);
-        consumer.wakeup(); // Interrupt consumer.poll() to exit gracefully
-    }
-
-    @Override
-    public void close() {
-        shutdown();
+        
         try {
             alertProducer.close();
             dlqProducer.close();
-            logger.info("All producers closed");
+            logger.info("Producers closed");
         } catch (Exception e) {
             logger.error("Error closing producers", e);
+        }
+    }
+    
+    public void shutdown() {
+        logger.info("Shutting down FX Risk Alert Consumer...");
+        running.set(false);
+        consumer.wakeup();
+    }
+    
+    @Override
+    public void close() {
+        shutdown();
+    }
+    
+    // For metrics/monitoring
+    public long getProcessedTradeCount() {
+        return processedTradeCount.get();
+    }
+    
+    public long getHighRiskTradeCount() {
+        return highRiskTradeCount.get();
+    }
+    
+    public long getFailedTradeCount() {
+        return failedTradeCount.get();
+    }
+    
+    /**
+     * Process a single trade record with the given ID and JSON payload.
+     * This method is primarily intended for testing.
+     * 
+     * @param tradeId The ID of the trade to process
+     * @param tradeJson The JSON representation of the trade
+     */
+    public void processRecord(String tradeId, String tradeJson) {
+        try {
+            FXTrade trade = deserializeTradeRecord(tradeJson);
+            RiskLevel riskLevel = trade.calculateRiskScore();
+            
+            processedTradeCount.incrementAndGet();
+            
+            if (riskLevel == RiskLevel.HIGH) {
+                highRiskTradeCount.incrementAndGet();
+                sendRiskAlert(tradeId, trade, riskLevel);
+            } else {
+                logger.info("Trade {} has {} risk level. No alert needed.", tradeId, riskLevel);
+            }
+        } catch (Exception e) {
+            logger.error("Failed to process trade record: {}", tradeId, e);
+            failedTradeCount.incrementAndGet();
+            sendToDlq(tradeId, tradeJson);
         }
     }
 }

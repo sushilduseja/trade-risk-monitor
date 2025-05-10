@@ -11,6 +11,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.*;
 
 public class FXTradeProducer implements AutoCloseable {
@@ -19,18 +21,22 @@ public class FXTradeProducer implements AutoCloseable {
     private final ExecutorService callbackExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
     public FXTradeProducer() {
-        this.producer = new KafkaProducer<>(KafkaConfig.getProducerProperties());
+        this.producer = createProducer();
+    }
+    
+    // Factory method that can be overridden in tests
+    protected KafkaProducer<String, String> createProducer() {
+        return new KafkaProducer<>(KafkaConfig.getProducerProperties());
     }
 
     public CompletableFuture<RecordMetadata> publishTrade(FXTrade trade) {
-        String key = trade.getTradeId();
+        String key = trade.getId();
         String value = JsonSerializer.serialize(trade);
 
-        logger.info("Publishing FX trade: {} {} for {} at rate {}",
+        logger.info("Publishing FX trade: {} {} for {}",
                 trade.getCurrencyPair(),
                 trade.getDirection(),
-                trade.getAmount(),
-                trade.getRate());
+                trade.getAmount());
 
         CompletableFuture<RecordMetadata> resultFuture = new CompletableFuture<>();
 
@@ -65,9 +71,25 @@ public class FXTradeProducer implements AutoCloseable {
         try {
             return future.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
-            logger.error("Timed out waiting for trade publication confirmation: {}", trade.getTradeId());
+            logger.error("Timed out waiting for trade publication confirmation: {}", trade.getId());
             throw new TimeoutException("Publish operation timed out after " + timeout);
         }
+    }
+    
+    /**
+     * Publishes a batch of trades asynchronously for maximum throughput.
+     * 
+     * @param trades List of trades to publish
+     * @return List of futures for each trade publication
+     */
+    public List<CompletableFuture<RecordMetadata>> publishTradeBatch(List<FXTrade> trades) {
+        List<CompletableFuture<RecordMetadata>> results = new ArrayList<>(trades.size());
+        
+        for (FXTrade trade : trades) {
+            results.add(publishTrade(trade));
+        }
+        
+        return results;
     }
 
     @Override

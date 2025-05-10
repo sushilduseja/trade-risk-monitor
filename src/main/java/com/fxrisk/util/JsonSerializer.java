@@ -48,6 +48,9 @@ public class JsonSerializer {
      */
     public static <T> T deserialize(String json, Class<T> clazz) {
         try {
+            if (json == null) {
+                throw new IllegalArgumentException("Cannot deserialize null value");
+            }
             return objectMapper.readValue(json, clazz);
         } catch (JsonProcessingException e) {
             logger.error("Failed to deserialize JSON to {}: {}", clazz.getSimpleName(), json, e);
